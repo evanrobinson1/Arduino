@@ -1,29 +1,22 @@
 /*
-  ESP32 pH Monitor + Simple Calibration (Easy-to-explain)
+  ESP32 pH Monitor + Simple Calibration (Easy to explain)
   -------------------------------------------------------
   Two webpages:
-    - "/" shows ONLY the current pH and a Calibrate button
-    - "/calibrate" opens in a new window and saves calibration
+    - "/" shows ONLY the current pH (SMOOTHED) and a Calibrate button
+    - "/calibrate" opens in a new window and saves calibration (UNSMOOTHED)
 
   Calibration is LINEAR and user-friendly:
     1) Basic (2-point): use pH 4.01 and pH 7.00 -> ONE straight line for all pH
     2) Optional (3rd point): add pH 9.18 -> TWO straight lines:
-         - one line for pH <= 7  (between 4 and 7)
-         - one line for pH >= 7  (between 7 and 9.18)
-       (This often fixes high-pH error without “curves” / quadratic math.)
+         - one line for pH <= 7  (between 4.01 and 7.00)
+         - one line for pH >= 7  (between 7.00 and 9.18)
 
   Measurement source is a compile-time switch:
     - INA226 bus voltage (stable)
     - ESP32 ADC on GPIO36 (ADC1)
 
-  Also includes:
-    - trimmed mean (drop min & max)
-    - optional IIR smoothing
-
   Notes:
-    - VOLTAGE_SCALE lets you correct if you used a resistor divider.
-    - The piecewise decision uses V7 as the breakpoint. We auto-handle whether voltage
-      increases or decreases with pH by comparing V4 and V7.
+    - Only the MAIN page applies IIR smoothing
 */
 
 // ===================== USER OPTIONS =====================
@@ -36,13 +29,9 @@ const char* ssid     = "innerstellar";
 const char* password = "starbaby";
 const int   port     = 1129;
 
-// ---- Optional smoothing ----
-#define ENABLE_IIR_SMOOTHING  1
-const float IIR_ALPHA = 0.15f;  // 0.05 smoother/slow, 0.15 good, 0.30 faster/less smooth
-
-// ---- Scaling if you have a divider between sensor output and measurement point ----
-// Example: divider halves voltage -> VOLTAGE_SCALE = 2.0
-static const float VOLTAGE_SCALE = 1.0f;
+// ---- Main page smoothing ----
+#define MAIN_PAGE_SMOOTHING  1
+const float MAIN_ALPHA = 0.15f;   // 0.05 smoother/slow, 0.15 good, 0.30 faster/less smooth
 
 // ===================== INCLUDES =====================
 #include <WiFi.h>
@@ -71,66 +60,21 @@ static const float PH9 = 9.18f;
 // Calibration model:
 // - Always have "low" line from (V4,4.01) to (V7,7.00)
 // - Optional "high" line from (V7,7.00) to (V9,9.18)
-bool  useTwoLines = false; // false = one line for all; true = two-line piecewise
+bool  useTwoLines = false;   // false = one line for all; true = piecewise two-line
+bool  typicalDirection = true; // true if V4 > V7 (common on many pH boards)
 
-float v7_break = 2.100f;   // stored for breakpoint decision
+float v7_break = 2.100f;
 
-float mLow = -2.49f;       // pH = mLow*V + bLow (for pH<=7 region)
+float mLow = -2.49f;
 float bLow = 10.4725f;
 
-float mHigh = -2.49f;      // pH = mHigh*V + bHigh (for pH>=7 region, if enabled)
+float mHigh = -2.49f;
 float bHigh = 10.4725f;
 
-#if ENABLE_IIR_SMOOTHING
-float filtV = NAN;
+// smoothing state for MAIN page only
+#if MAIN_PAGE_SMOOTHING
+float filtV_main = NAN;
 #endif
-
-// ===================== HELPERS =====================
-static inline bool voltagesIncreaseAsPhDrops(float V4, float V7) {
-  // Typical pH circuits: pH4 voltage > pH7 voltage (V4 > V7)
-  return (V4 > V7);
-}
-
-// Choose which line to use if we have two lines.
-// We use the V7 breakpoint in VOLT space. Because some circuits invert,
-// we decide using the sign from V4 vs V7.
-float calculatePH(float v_sensor) {
-  if (!useTwoLines) {
-    return mLow * v_sensor + bLow;
-  }
-
-  // If V4 > V7 (typical), then:
-  //   - voltages >= V7 correspond to pH <= 7 (low line)
-  //   - voltages <  V7 correspond to pH >  7 (high line)
-  // If V4 < V7 (inverted), reverse it.
-  bool typical = voltagesIncreaseAsPhDrops(v7_break + 0.5f, v7_break); // dummy not used
-  // Better: infer from slopes? We'll store v7_break and determine typical by comparing saved V4 & V7.
-  // We didn't store V4. So we infer typical by checking which line has slope sign relative to expectations:
-  // Simpler & robust: compare predicted pH at v7_break using each line:
-  // both should give ~7, so not helpful.
-  // Best: store a flag during calibration.
-  // We'll do that: store "typical" flag in NVS and use it here.
-  // (see load/save functions)
-  return 0.0f; // placeholder; overridden below (after we load typical flag)
-}
-
-// We'll store this during calibration so piecewise selection is correct.
-bool typicalDirection = true; // true if V4 > V7 (pH down -> volts up)
-
-// Now the real piecewise calculate using stored typicalDirection:
-float calculatePH_piecewise(float v_sensor) {
-  if (!useTwoLines) return mLow * v_sensor + bLow;
-
-  if (typicalDirection) {
-    // V4 > V7 > V9 (usually)
-    if (v_sensor >= v7_break) return mLow * v_sensor + bLow;   // pH <= 7 side
-    else                      return mHigh * v_sensor + bHigh; // pH >= 7 side
-  } else {
-    // inverted mapping
-    if (v_sensor <= v7_break) return mLow * v_sensor + bLow;
-    else                      return mHigh * v_sensor + bHigh;
-  }
-}
 
 // ===================== LOAD/SAVE CAL =====================
 void loadCalibration() {
@@ -141,8 +85,8 @@ void loadCalibration() {
 
   v7_break = prefs.getFloat("v7", v7_break);
 
-  mLow = prefs.getFloat("mL", mLow);
-  bLow = prefs.getFloat("bL", bLow);
+  mLow  = prefs.getFloat("mL", mLow);
+  bLow  = prefs.getFloat("bL", bLow);
 
   mHigh = prefs.getFloat("mH", mHigh);
   bHigh = prefs.getFloat("bH", bHigh);
@@ -165,7 +109,6 @@ void saveOneLine(float V4, float V7) {
   prefs.putFloat("v7", V7);
   prefs.putFloat("mL", m);
   prefs.putFloat("bL", b);
-  // still store high line same as low (harmless)
   prefs.putFloat("mH", m);
   prefs.putFloat("bH", b);
   prefs.end();
@@ -173,21 +116,20 @@ void saveOneLine(float V4, float V7) {
   useTwoLines      = false;
   typicalDirection = (V4 > V7);
   v7_break = V7;
-  mLow = m; bLow = b;
+
+  mLow = m;  bLow = b;
   mHigh = m; bHigh = b;
 
-#if ENABLE_IIR_SMOOTHING
-  filtV = NAN;
+#if MAIN_PAGE_SMOOTHING
+  filtV_main = NAN; // reset smoothing after calibration change
 #endif
 }
 
 void saveTwoLines(float V4, float V7, float V9) {
-  // Low line: (V4,4.01) to (V7,7.00)
   float mL = (PH4 - PH7) / (V4 - V7);
   float bL = PH7 - mL * V7;
 
-  // High line: (V7,7.00) to (V9,9.18)
-  float mH = (PH7 - PH9) / (V7 - V9);   // same as (PH9-PH7)/(V9-V7)
+  float mH = (PH7 - PH9) / (V7 - V9);
   float bH = PH7 - mH * V7;
 
   prefs.begin("phcal", false);
@@ -203,19 +145,35 @@ void saveTwoLines(float V4, float V7, float V9) {
   useTwoLines      = true;
   typicalDirection = (V4 > V7);
   v7_break = V7;
-  mLow = mL; bLow = bL;
+
+  mLow = mL;  bLow = bL;
   mHigh = mH; bHigh = bH;
 
-#if ENABLE_IIR_SMOOTHING
-  filtV = NAN;
+#if MAIN_PAGE_SMOOTHING
+  filtV_main = NAN;
 #endif
 }
 
-// ===================== VOLTAGE READ =====================
+// ===================== pH CALC =====================
+float calculatePH_piecewise(float v) {
+  if (!useTwoLines) return mLow * v + bLow;
+
+  // Decide which line based on which side of V7 we are on.
+  if (typicalDirection) {
+    // Usually V4 > V7 > V9
+    if (v >= v7_break) return mLow * v + bLow;   // pH <= 7 side
+    else               return mHigh * v + bHigh; // pH >= 7 side
+  } else {
+    // Inverted mapping
+    if (v <= v7_break) return mLow * v + bLow;
+    else               return mHigh * v + bHigh;
+  }
+}
+
+// ===================== VOLTAGE READ (raw vs smoothed) =====================
 #if USE_INA226
 
-float readPHVoltage() {
-  // INA226 bus voltage, trimmed mean (drop min & max) + optional IIR smoothing
+float readVoltageRawTrimmed() {
   const int N = 20;
   float sum = 0.0f;
   float mn =  1e9f;
@@ -231,23 +189,12 @@ float readPHVoltage() {
 
   sum -= mn;
   sum -= mx;
-  float v = sum / (float)(N - 2);
-
-  float v_sensor = v * VOLTAGE_SCALE;
-
-#if ENABLE_IIR_SMOOTHING
-  if (isnan(filtV)) filtV = v_sensor;
-  filtV = filtV + IIR_ALPHA * (v_sensor - filtV);
-  return filtV;
-#else
-  return v_sensor;
-#endif
+  return sum / (float)(N - 2);
 }
 
 #else
 
-float readPHVoltage() {
-  // ESP32 ADC, trimmed mean (drop min & max) + optional IIR smoothing
+float readVoltageRawTrimmed() {
   const int N = 25;
   uint32_t sum = 0;
   uint16_t mn = 4095;
@@ -264,38 +211,40 @@ float readPHVoltage() {
   sum -= mn;
   sum -= mx;
   float avgCounts = (float)sum / (float)(N - 2);
-
-  float v_pin = (avgCounts / ADC_MAX) * ADC_VREF;
-  float v_sensor = v_pin * VOLTAGE_SCALE;
-
-#if ENABLE_IIR_SMOOTHING
-  if (isnan(filtV)) filtV = v_sensor;
-  filtV = filtV + IIR_ALPHA * (v_sensor - filtV);
-  return filtV;
-#else
-  return v_sensor;
-#endif
+  return (avgCounts / ADC_MAX) * ADC_VREF;
 }
 
 #endif
 
+float readVoltageMainSmoothed() {
+  float v = readVoltageRawTrimmed();
+
+#if MAIN_PAGE_SMOOTHING
+  if (isnan(filtV_main)) filtV_main = v;
+  filtV_main = filtV_main + MAIN_ALPHA * (v - filtV_main);
+  return filtV_main;
+#else
+  return v;
+#endif
+}
+
 // ===================== API HANDLERS =====================
 void handlePH() {
-  float v = readPHVoltage();
+  // Main page uses SMOOTHED voltage -> smoother pH
+  float v = readVoltageMainSmoothed();
   float p = calculatePH_piecewise(v);
   server.send(200, "text/plain", String(p, 2));
 }
 
 void handlePHV() {
-  float v = readPHVoltage();
+  // Calibration page shows RAW (no smoothing)
+  float v = readVoltageRawTrimmed();
   server.send(200, "text/plain", String(v, 4));
 }
 
 void handleCalJson() {
-  // Show current active formula(s) on calibration page
   String json = "{";
   json += "\"two\":" + String(useTwoLines ? "true" : "false") + ",";
-  json += "\"typ\":" + String(typicalDirection ? "true" : "false") + ",";
   json += "\"v7\":" + String(v7_break, 4) + ",";
   json += "\"mL\":" + String(mLow, 8) + ",";
   json += "\"bL\":" + String(bLow, 8) + ",";
@@ -305,16 +254,16 @@ void handleCalJson() {
   server.send(200, "application/json", json);
 }
 
-// 2-point: /setcal2?v7=2.100&v4=2.600
+// 2-point: /setcal2?v4=...&v7=...
 void handleSetCal2() {
-  if (!server.hasArg("v7") || !server.hasArg("v4")) {
-    server.send(400, "text/plain", "Missing v7 or v4");
+  if (!server.hasArg("v4") || !server.hasArg("v7")) {
+    server.send(400, "text/plain", "Missing v4 or v7");
     return;
   }
-  float V7 = server.arg("v7").toFloat();
   float V4 = server.arg("v4").toFloat();
+  float V7 = server.arg("v7").toFloat();
 
-  if (V7 <= 0.0f || V4 <= 0.0f) {
+  if (V4 <= 0.0f || V7 <= 0.0f) {
     server.send(400, "text/plain", "Voltages must be > 0");
     return;
   }
@@ -324,22 +273,20 @@ void handleSetCal2() {
   }
 
   saveOneLine(V4, V7);
-
-  server.send(200, "text/plain",
-    "Saved ONE line using pH 4.01 & 7.00");
+  server.send(200, "text/plain", "Saved ONE line using pH 4.01 & 7.00");
 }
 
-// 3-point (two lines): /setcal3?v7=...&v4=...&v9=...
+// 3-point (two lines): /setcal3?v4=...&v7=...&v9=...
 void handleSetCal3() {
-  if (!server.hasArg("v7") || !server.hasArg("v4") || !server.hasArg("v9")) {
-    server.send(400, "text/plain", "Missing v7 or v4 or v9");
+  if (!server.hasArg("v4") || !server.hasArg("v7") || !server.hasArg("v9")) {
+    server.send(400, "text/plain", "Missing v4 or v7 or v9");
     return;
   }
-  float V7 = server.arg("v7").toFloat();
   float V4 = server.arg("v4").toFloat();
+  float V7 = server.arg("v7").toFloat();
   float V9 = server.arg("v9").toFloat();
 
-  if (V7 <= 0.0f || V4 <= 0.0f || V9 <= 0.0f) {
+  if (V4 <= 0.0f || V7 <= 0.0f || V9 <= 0.0f) {
     server.send(400, "text/plain", "Voltages must be > 0");
     return;
   }
@@ -349,9 +296,7 @@ void handleSetCal3() {
   }
 
   saveTwoLines(V4, V7, V9);
-
-  server.send(200, "text/plain",
-    "Saved TWO lines (4->7) and (7->9.18)");
+  server.send(200, "text/plain", "Saved TWO lines (4->7) and (7->9.18)");
 }
 
 // ===================== PAGES =====================
@@ -379,16 +324,16 @@ void handleRoot() {
     "<h2>pH Monitor</h2>"
     "<div id='ph'>--</div>"
     "<div style='margin:16px 0'>"
-    "<button onclick=\"window.open('/calibrate','phcal','width=560,height=720');\">Calibrate</button>"
+    "<button onclick=\"window.open('/calibrate','phcal','width=560,height=740');\">Calibrate</button>"
     "</div>"
-    "<small>Updates every 2 seconds</small>"
+    "<small>Smooth display (updates every 2 seconds)</small>"
     "</div></body></html>";
 
   server.send(200, "text/html", html);
 }
 
 void handleCalibrate() {
-  // Calibration page: user enters voltages for pH 7, pH 4, optional pH 9.18
+  // Calibration page: display entry order 4.01 first, then 7.00, then optional 9.18
   String html =
     "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
     "<style>"
@@ -413,21 +358,21 @@ void handleCalibrate() {
     "  }catch(e){console.log(e);}"
     "}"
     "async function save2(){"
-    "  const v7 = document.getElementById('v7').value;"
     "  const v4 = document.getElementById('v4').value;"
+    "  const v7 = document.getElementById('v7').value;"
     "  const msg = document.getElementById('msg'); msg.innerText='';"
     "  try{"
-    "    const t = await fetch(`/setcal2?v7=${encodeURIComponent(v7)}&v4=${encodeURIComponent(v4)}`,{cache:'no-store'}).then(r=>r.text());"
+    "    const t = await fetch(`/setcal2?v4=${encodeURIComponent(v4)}&v7=${encodeURIComponent(v7)}`,{cache:'no-store'}).then(r=>r.text());"
     "    msg.innerText=t; refresh();"
     "  }catch(e){msg.innerText='Save failed';}"
     "}"
     "async function save3(){"
-    "  const v7 = document.getElementById('v7').value;"
     "  const v4 = document.getElementById('v4').value;"
+    "  const v7 = document.getElementById('v7').value;"
     "  const v9 = document.getElementById('v9').value;"
     "  const msg = document.getElementById('msg'); msg.innerText='';"
     "  try{"
-    "    const t = await fetch(`/setcal3?v7=${encodeURIComponent(v7)}&v4=${encodeURIComponent(v4)}&v9=${encodeURIComponent(v9)}`,{cache:'no-store'}).then(r=>r.text());"
+    "    const t = await fetch(`/setcal3?v4=${encodeURIComponent(v4)}&v7=${encodeURIComponent(v7)}&v9=${encodeURIComponent(v9)}`,{cache:'no-store'}).then(r=>r.text());"
     "    msg.innerText=t; refresh();"
     "  }catch(e){msg.innerText='Save failed';}"
     "}"
@@ -435,15 +380,18 @@ void handleCalibrate() {
     "setInterval(refresh,2000);window.onload=refresh;"
     "</script></head><body>"
     "<div id='box'>"
-    "<h2>pH Calibration (Simple Lines)</h2>"
-    "<div class='row'>Live pHv: <b><span id='phv'>--</span></b> V</div>"
-    "<div class='row'>pH 7.00 voltage: <input id='v7' type='number' step='0.001' value='2.100'></div>"
-    "<div class='row'>pH 4.01 voltage: <input id='v4' type='number' step='0.001' value='2.600'></div>"
+    "<h2>pH Calibration</h2>"
+    "<div class='row'>Live pHv (raw): <b><span id='phv'>--</span></b> V</div>"
     "<hr>"
-    "<div class='row'><b>Optional:</b> Add a second line above pH 7 using pH 9.18</div>"
-    "<div class='row'>pH 9.18 voltage: <input id='v9' type='number' step='0.001' value='1.800'></div>"
+    "<div class='row'>pH 4.01 voltage: <input id='v4' type='number' step='0.001' value='2.600'></div>"
+    "<div class='row'>pH 7.00 voltage: <input id='v7' type='number' step='0.001' value='2.100'></div>"
     "<div>"
     "<button onclick='save2()'>Save ONE line (4 & 7)</button>"
+    "</div>"
+    "<hr>"
+    "<div class='row'><b>Optional:</b> add a second line above pH 7 using pH 9.18</div>"
+    "<div class='row'>pH 9.18 voltage: <input id='v9' type='number' step='0.001' value='1.800'></div>"
+    "<div>"
     "<button onclick='save3()'>Save TWO lines (4,7,9.18)</button>"
     "<button class='gray' onclick='closeMe()'>Close</button>"
     "</div>"
