@@ -25,9 +25,9 @@
 #define USE_INA226   1   // 1 = INA226, 0 = ESP32 ADC
 
 // ---- WiFi ----
-const char* ssid     = "innerstellar";
-const char* password = "starbaby";
-const int   port     = 1129;
+const char* ssid     = "enter your network ID here";
+const char* password = "enter your network port here";
+const int   port     = 80;  // modify if desired
 
 // ---- Main page smoothing ----
 #define MAIN_PAGE_SMOOTHING  1
